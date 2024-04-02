@@ -11,7 +11,7 @@ class PolicyNet(torch.nn.Module):
                  action_dim,
                  action_scale=1.,
                  action_bias=0, log_std_min=-20, log_std_max=2, eps=1e-6, device='cpu'):
-        """Here the action dim is used as preform diag-GMM model,
+        """Here the action dim can also be used as preform GMM model,
         for each step, the logprob can be cal by p(y)dy=p(x)dx, and x=f^{-1}(y)
         to this end p(y)=p(x)tanh^{-1}(y)
         """
