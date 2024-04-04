@@ -5,3 +5,5 @@ Address Multi-Discrete action space problem with SAC,
 Baseline DQN with Multi-Head sum up
 
 Env is used to ceate BeamHopping GYM env with Multi-Discrete action space
+
+About SAC with Gumbel-softmax can achive 310+ score with BipedalWalker-v3
