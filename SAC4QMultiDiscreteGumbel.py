@@ -1,4 +1,3 @@
-
 from utils import one_hot, gumbel_softmax, ReplayBeffer, TargetEntropySchedule
 import torch
 import numpy as np
@@ -29,30 +28,34 @@ class DiscretizedWrapper(gym.Wrapper):
             [self.discretized[a, index] for index, a in np.ndenumerate(action)]
         ).flatten()
         next_state, reward, done, _, log_info = super().step(action)
-        return next_state, reward, done,  log_info
+        return next_state, reward, done, log_info
 
 
 class PolicyNet(torch.nn.Module):
-    def __init__(self, state_dim, action_dim, repeat_action, ):
+    def __init__(self, state_dim, action_dim, repeat_action, temperature_init=5.):
         super(PolicyNet, self).__init__()
         self.action_dim = action_dim
         self.repeat_action = repeat_action
+        self.temperature_init = temperature_init
         self.model = torch.nn.Sequential(*[torch.nn.Linear(state_dim, 256),
                                            torch.nn.ReLU(),
                                            torch.nn.Linear(256, 256),
                                            torch.nn.ReLU(),
-                                           torch.nn.Linear(256, repeat_action * action_dim)])
+                                           torch.nn.Linear(256, action_dim * repeat_action)])
 
     def forward(self, x):
-        logits = self.model(x).reshape([-1, self.repeat_action, self.action_dim])
-        return logits
+        x = self.model(x).reshape([-1, self.repeat_action, self.action_dim])
+        return x
 
-    def action(self, state, require_prob=False, deterministically=False):
+    def action(self, state, deterministically=False):
         logits = self(state)
         if deterministically:
             return torch.max(logits, dim=-1)[1]
         else:
-            action_one_hot, _, log_prob = gumbel_softmax(logits=logits, dim=-1, require_prob=True)
+            action_one_hot, _, log_prob = gumbel_softmax(logits=logits,
+                                                         tau=self.temperature_init,
+                                                         dim=-1,
+                                                         require_prob=True)
             log_prob = (log_prob * action_one_hot).sum(-1).sum(-1)
             return action_one_hot, log_prob
 
@@ -92,18 +95,24 @@ class SAC:
 
     def __init__(self,
                  env,
+                 env_max_step_train=2_000,
+                 env_max_step_eval=2_000,
                  learning_rate=5e-4,
                  buffer_size=10000,
                  learning_starts=1000,
                  batch_size=128,
-                 tau=.01,
-                 gamma=0.99,
+                 tau=.05,
+                 gamma=0.95,
                  train_freq=4,
                  gradient_steps=1,
                  target_update_interval=1,
-                 init_entropy_weight=2.,
-                 max_grad_norm=10):
+                 init_entropy_weight=.5,
+                 max_grad_norm=10,
+                 print_interval=1_000):
         self.env = env
+        self.train_max_step = env_max_step_train
+        self.eval_max_step = env_max_step_eval
+        self.print_interval = print_interval
         self.lr = learning_rate
         self.replay_buffer = ReplayBeffer(buffer_maxlen=buffer_size)
         self.learn_starts = learning_starts
@@ -121,14 +130,15 @@ class SAC:
         self.entropy_weight = torch.ones(1) * init_entropy_weight
         self.entropy_weight.requires_grad = True
         self.entropy_target = TargetEntropySchedule(init_entropy=None)
+        # self.entropy_target = .9 * np.log(self.action_dim)
         self.ent_optim = torch.optim.Adam([self.entropy_weight], lr=self.lr)
 
         self.step_counter = 0
 
         self.accumulate_reward_max = - np.inf
 
-        self.q0_net = ValueNet(state_dim=self.obs_dim + self.action_dim*self.repeat_action)
-        self.q1_net = ValueNet(state_dim=self.obs_dim + self.action_dim*self.repeat_action)
+        self.q0_net = ValueNet(state_dim=self.obs_dim + self.action_dim * self.repeat_action)
+        self.q1_net = ValueNet(state_dim=self.obs_dim + self.action_dim * self.repeat_action)
 
         self.q0_tar = deepcopy(self.q0_net)
         self.q1_tar = deepcopy(self.q1_net)
@@ -176,7 +186,7 @@ class SAC:
         done = self._get_done_mask(done)
         action_one_hot = action_one_hot.reshape([action_one_hot.shape[0], -1])
         with torch.no_grad():
-            action_next, log_prob_next = self.policy_net.action(next_state, require_prob=True)
+            action_next, log_prob_next = self.policy_net.action(next_state)
             action_next = action_next.reshape([action_next.shape[0], -1])
             q0_tar_next = self.q0_tar(torch.cat([next_state, action_next], dim=-1))
             q1_tar_next = self.q1_tar(torch.cat([next_state, action_next], dim=-1))
@@ -197,7 +207,7 @@ class SAC:
         torch.nn.utils.clip_grad_norm_(self.q1_net.parameters(), self.max_grad_norm)
         self.q1_optim.step()
 
-        action, log_prob = self.policy_net.action(state, require_prob=True)
+        action, log_prob = self.policy_net.action(state)
         action = action.reshape([action.shape[0], -1])
         q0_est_g = self.q0_net(torch.cat([state, action], dim=-1))
         q1_est_g = self.q1_net(torch.cat([state, action], dim=-1))
@@ -207,12 +217,11 @@ class SAC:
         loss_p.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
         self.policy_optim.step()
-        ent_tar = self.entropy_target.step(log_prob)
+        ent_tar = self.entropy_target.step(-log_prob.detach().mean())
         l_ent = self.entropy_weight * (-log_prob - ent_tar).detach().mean()
         self.ent_optim.zero_grad()
         l_ent.backward()
         self.ent_optim.step()
-
         self.q0_tar.load_state_dict(self.polyak_dict(self.q0_net, self.q0_tar, self.tau))
         self.q1_tar.load_state_dict(self.polyak_dict(self.q1_net, self.q1_tar, self.tau))
 
@@ -220,8 +229,7 @@ class SAC:
         self.step_counter = 0
         while self.step_counter < step + self.learn_starts:
             state = self.env.reset()
-            done = False
-            while not done:
+            for _ in range(self.train_max_step):
                 action, _ = self.policy_net.action(self._state_reformat(state))
                 action = action.argmax(-1).detach().cpu().numpy().squeeze()
                 next_state, reward, done, log_info = self.env.step(action)
@@ -233,18 +241,17 @@ class SAC:
                 if self.step_counter > self.learn_starts and self.step_counter % self.train_freq == 0:
                     for _ in range(self.gradient_steps):
                         self.model_update()
+                if self.step_counter % self.print_interval == 0:
+                    print(self.eval(5), self.entropy_weight)
                 if done:
                     break
-                if self.step_counter % 1000 == 0:
-                    print(self.eval(5), self.entropy_weight)
 
     def eval(self, epoch):
         m_reward = []
         for _ in range(epoch):
             state = self.env.reset()
             lw = 0.
-            done = False
-            while not done:
+            for _ in range(self.eval_max_step):
                 action = self.policy_net.action(self._state_reformat(state), deterministically=True)
                 action = action.detach().cpu().numpy().squeeze()
                 next_state, reward, done, log_info = self.env.step(action)
@@ -256,8 +263,34 @@ class SAC:
         return np.mean(m_reward)
 
 
+class Walker(gym.Env):
+    def __init__(self, bins=20):
+        self.env = gym.make("BipedalWalker-v3")
+        self.env = gym.wrappers.RecordEpisodeStatistics(self.env)
+        self.observation_space = self.env.observation_space
+        self.action_space = gym.spaces.MultiDiscrete([bins]*self.env.action_space.shape[0])
+        self.discrete_action = np.linspace(-1., 1., bins)
+
+    def step(self, action):
+        action = self.discrete_action[action]
+        next_state, reward, done, _, info = self.env.step(action)
+        if self.env.game_over:
+            reward = -10.
+        return next_state, reward, done, info
+
+    def reset(self):
+        next_state = self.env.reset()[0]
+        return next_state
+
+    def render(self, mode="human"):
+        self.env.render(mode=mode)
+
+    def seed(self, seed=None):
+        self.env.seed(seed)
+
+
 if __name__ == '__main__':
-    env = DiscretizedWrapper(gym.make("BipedalWalker-v3"), nb_bin=20)
+    env = Walker()
     model = SAC(env)
     model.learn(1e6)
     print(model.eval(20))
